@@ -1,0 +1,457 @@
+#!/bin/bash
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+#
+# freemyipd
+# A daemon for the freemyip.com service to maintain dynamic DNS records and
+# Let's Encrypt certificates
+#
+# Copyright 2025 D. Murphy
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+[[ $# -gt 0 ]] || help=1
+
+while [[ -n "$1" ]]; do
+  case "$1" in
+    -c|--config)      shift; config="$1"               ;;
+    -e|--certificate) cert=1                           ;;
+    -h|--help)        help=1                           ;;
+    -n|--nat)         nat=1                            ;;
+    -4|--ddns-ipv4)   dns4=1                           ;;
+    -6|--ddns-ipv6)   dns6=1                           ;;
+       --about)       about=1                          ;;
+       --)            shift; commands=( "$@" ); break  ;;
+    *)                echo "invalid option $1"; exit 1 ;;
+  esac
+  shift
+done
+
+if ((about)); then
+  echo "
+Freemyipd is a daemon that maintains dynamic DNS records and TLS certificates
+for the freemyip.com service. The public IP address is polled, using either the
+local routing table or URL lookup, and is synchronized with freemyip.com when a
+change is detected. TLS certificates are obtained from Let's Encrypt and managed
+using lego."
+  exit 0
+fi
+
+if ((help)); then
+  echo "
+A daemon to maintain dynamic DNS records and SSL/TLS certificates for the
+freemyip.com service
+
+Usage: [variables] freemyipd [options]
+
+freemyipd is configured by a combination of environment variables and runtime
+options
+
+Command options:
+  -h, --help           show this message and exit
+  -c, --config <path>  source variables from config file
+  -4, --ddns-ipv4      maintain DNS A record
+  -6, --ddns-ipv6      maintain DNS AAAA record
+  -e, --certificate    maintain SSL/TLS wildcard certificate
+  -n, --nat            get ipv4 address from the web when behind NAT
+      --about          show program description
+      --               any arguments after -- will be passed to bash and
+                       executed when new certificates are received
+
+Environment variables:
+  TOKEN=     freemyip token. required
+  DOMAIN=    freemyip subdomain. required
+  DEVICE=    network device to watch. not valid with --nat
+  INTERVAL=  polling interval in seconds. defaults to 60, or 600 when behind NAT
+  LOGFILE=   log file. leave unset to log to syslog
+  EMAIL=     email address to use for Let's Encrypt account
+  LEGOPATH=  path to store Let's Encrypt account and certificate. defaults to
+             \$HOME/.lego
+  CERTUSER=  user who needs read access to the TLS certificate, if different
+             than the calling user
+  RENEWBY=   days before certificate expiration to attempt renewal. defaults to
+             15"
+  exit 0
+fi
+
+if [[ -z $INTERVAL ]]; then
+  if (($nat)); then
+    INTERVAL=600
+  else
+    INTERVAL=60
+  fi
+fi
+
+LEGOPATH="${LEGOPATH:=$HOME/.lego}"
+RENEWBY=${RENEWBY:=15}
+
+function die {
+  echo "$2"
+  exit $1
+}
+
+# Verify that dependencies are installed
+execs=( curl ip awk chmod chgrp )
+[[ -z $cert ]]    || execs+=( lego openssl )
+[[ -n $LOGFILE ]] || execs+=( logger )
+
+for i in ${execs[@]}; do
+  if ! command -v $i >/dev/null 2>&1; then
+    die 2 "$i executable not found. exiting"
+  fi
+done
+
+# Read config file or exit if not found
+if [[ -f "$config" ]]; then
+  vars=( TOKEN DOMAIN DEVICE INTERVAL LOGFILE EMAIL LEGOPATH CERTUSER RENEWBY )
+  while read line; do
+    for i in ${vars[@]}; do
+      if [[ "$line" =~ ^\ *$i\ *=\ *.+ ]]; then
+        printf -v line "${line#*=}"
+        printf -v line "${line#"${line%%[! ]*}"}"
+        printf -v $i "${line%"${line##*[! ]}"}"
+        continue 2
+      fi
+    done
+  done < "$config"
+elif [[ -n "$config" ]]; then
+  die 3 "configuration file '$config' not found"
+fi
+
+# Validate configuration
+! ((dns4)) || ((nat)) || [[ -f /proc/net/fib_trie ]] || die 4 "/proc/net/fib_trie not found. exiting"
+! ((dns6)) || [[ -f /proc/net/if_inet6 ]]            || die 5 "/proc/net/if_inet6 not found. exiting"
+[[ -n $TOKEN ]]                                      || die 6 "pass freemyip token with TOKEN="
+[[ -n $DOMAIN ]]                                     || die 7 "pass freemyip subdomain with DOMAIN="
+[[ $RENEWBY -le 30 ]]                                || die 8 "cannot renew certificate more than 30 days in advance"
+! ((nat)) || [[ $INTERVAL -ge 300 ]]                 || die 9 "interval less than 300 not permitted when behind NAT"
+! ((dns4)) || [[ -n $DEVICE ]] || ((nat))            || die 10 "pass device to monitor with DEVICE="
+! ((dns6)) || [[ -n $DEVICE ]]                       || die 11 "pass device to monitor with DEVICE="
+[[ -z $DEVICE ]] || [[ -e /sys/class/net/$DEVICE ]]  || die 12 "network device $DEVICE not found"
+
+# Bash loadable
+[[ -f /usr/lib/bash/sleep ]] && enable -f /usr/lib/bash/sleep sleep
+
+### Define functions ###########################################################
+
+# Write to log file
+function log {
+  if [[ -n $LOGFILE ]]; then
+    local date
+    printf -v date '%(%F %H:%M)T'
+    echo "[$date]" "$@" >> "$LOGFILE"
+  else
+    logger -t freemyipd "$@"
+  fi
+}
+
+# Formats an ipv6 address from /proc/net/if_inet6 to standard notation
+function fmtip6 {
+  local j k ans
+
+  [[ $2 =~ ^[0-9a-f]{32}$ ]] || return 1
+
+  for j in {0..7}; do
+    k[$j]="${2:$((j*4)):4}"
+    case ${k[$j]} in
+      0000) k[$j]=0            ;;
+      000*) k[$j]=${k[$j]:3:1} ;;
+      00*)  k[$j]=${k[$j]:2:2} ;;
+      0*)   k[$j]=${k[$j]:1:3} ;;
+    esac
+  done
+
+  for j in {0..8}; do
+    ans+=:${k[$j]}
+  done
+
+  case $ans in
+    *:0:0:0:0:0:0:0:*) ans=${ans/:0:0:0:0:0:0:0:/::} ;;
+    *:0:0:0:0:0:0:*)   ans=${ans/:0:0:0:0:0:0:/::}   ;;
+    *:0:0:0:0:0:*)     ans=${ans/:0:0:0:0:0:/::}     ;;
+    *:0:0:0:0:*)       ans=${ans/:0:0:0:0:/::}       ;;
+    *:0:0:0:*)         ans=${ans/:0:0:0:/::}         ;;
+    *:0:0:*)           ans=${ans/:0:0:/::}           ;;
+  esac
+
+  [[ $ans =~ ^::.* ]] || ans=${ans#:}
+  [[ $ans =~ .*::$ ]] || ans=${ans%:}
+
+  printf -v $1 $ans && return 0
+}
+
+# Test if an ipv4 address is valid and non-local
+function valip {
+  local ip
+
+  [[ $1 =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+
+  IFS=. read -a ip <<< $1
+  for i in {0..3}; do
+    [[ $((${ip[$i]}/256)) -eq 0 ]] || return 1
+  done
+
+  if [[ $1 =~ ^(10\.|127\.|192\.168\.) ]]; then
+    return 2
+  elif [[ $1 =~ ^172\. && $((${ip[1]}/16)) -eq 1 ]]; then
+    return 2
+  elif [[ $1 =~ ^100\. && $((${ip[1]}/64)) -eq 1 ]]; then
+    return 2
+  fi
+
+  return 0
+}
+
+# Return the public ipv4 address
+function getip {
+  local line ip a
+
+  # Get IP from routing table if device has a public IP
+  if ! (($nat)); then
+    while read line; do
+      if [[ "$line" == "/32 host LOCAL" ]] && valip $ip; then
+
+        # Return if previous IP still found in routing table
+        if [[ $ip == ${!1} ]]; then
+          return 0
+        else
+          a+=( $ip )
+        fi
+      fi
+      ip="${line#* }"
+    done < /proc/net/fib_trie
+
+    # This point is only reached on startup or when IP address changes
+    if [[ -n ${a[0]} ]]; then
+
+      # Only empty at startup; otherwise log the change
+      [[ -z $new4 ]] || log "ipv4 routing table has changed"
+
+      # Return address from routing table if it matches address from ip command
+      ip=$(ip addr show $DEVICE | awk -F '(/|[ ]+)' '/inet /{print $3}')
+      if valip $ip && [[ ${a[@]} =~ [^0-9]*${ip}[^0-9]* ]]; then
+        printf -v $1 $ip && return 0
+      fi
+    fi
+
+  # If behind NAT, pull IP from the web instead
+  else
+    ip=$(curl ipinfo.io/ip)
+    if valip $ip; then
+      if [[ $ip == ${!1} ]]; then
+        return 0
+      else
+        printf -v $1 $ip && return 0
+      fi
+    fi
+  fi
+
+  # If still here, no public IP address was found
+  printf -v $1 %b -1 && return 1
+}
+
+# Return the public ipv6 address
+function getip6 {
+  local line ip a
+
+  # Get IP from routing table if device has a public IP
+  while read line; do
+    if [[ "$line" =~ ^(2|3).*$DEVICE$ ]]; then
+      fmtip6 ip "${line%% *}"
+
+      # Return if previous IP still found in routing table
+      if [[ $ip == ${!1} ]]; then
+        return 0
+      else
+        a+=( $ip )
+      fi
+    fi
+  done < /proc/net/if_inet6
+
+  # This point is only reached on startup or when IP address changes
+  if [[ -n ${a[0]} ]]; then
+
+    # Only empty at startup; otherwise log the change
+    [[ -z $new6 ]] || log "ipv6 routing table has changed"
+
+    # If multiple global addresses in table, choose the first one that matches to the ip command
+    if [[ ${#a[@]} -gt 1 ]]; then
+      ip=$(ip -6 addr show $DEVICE scope global -temporary -deprecated | awk -F '(/|[ ]+)' '/inet6 (2|3)/{print $3; exit}')
+    fi
+
+    # Return address
+    if [[ ${a[@]} =~ [^0-9a-f]*${ip}[^0-9a-f]* ]]; then
+      printf -v $1 $ip && return 0
+    fi
+  fi
+
+  ### FOR NOW ASSUME IPV6 WILL NOT BE BEHIND NAT ###
+  ### PLACEHOLDER ip=$(curl v6.ipinfo.io/ip) #######
+
+  # If still here, no public IP address was found
+  printf -v $1 %b -1 && return 1
+}
+
+# Return certificate expiration date
+function datecert {
+  printf -v nowdate '%(%s)T'
+
+  local a="$(openssl x509 -enddate -noout -in "$LEGOPATH/certificates/$DOMAIN.freemyip.com.crt")"
+  printf -v $1 $(date +%s --date="${a#*=}")
+
+  log "certificate valid for $(( (${!1} - $nowdate) / 86400 )) days"
+}
+
+# Create or renew certificate. First argument (run|renew) is passed to lego
+function gencert {
+  printf -v lastcheck '%(%s)T'
+  FREEMYIP_TOKEN=$TOKEN                   \
+  lego --accept-tos                       \
+       --dns freemyip                     \
+       --domains "$DOMAIN.freemyip.com"   \
+       --domains "*.$DOMAIN.freemyip.com" \
+       --email "$EMAIL"                   \
+       --path "$LEGOPATH"                 \
+       $1                                 \
+    && datecert enddate
+
+  # Renewal date has been extended if successful
+  if [[ $(($enddate - $nowdate)) -gt $(($RENEWBY * 86400)) ]]; then
+
+    # Change group ownership to allow $CERTUSER access
+    if [[ -n $CERTUSER ]]; then
+      chmod g+x "$LEGOPATH/certificates"
+      chmod -R g+r "$LEGOPATH/certificates"
+      chgrp -R $CERTUSER "$LEGOPATH/certificates"
+    fi
+    log "certificate written to '$LEGOPATH/certificates'"
+
+    # Run post renewal hook
+    if [[ -n ${commands[0]} ]]; then
+      commands=( "${commands[@]/#/\"}" )
+      commands=( "${commands[@]/%/\"}" )
+      bash <<EOF
+${commands[@]}
+EOF
+    fi
+
+  # Log failure if certificate was not created
+  else
+    log "failed to " ${1/run/generate} " certificate"
+  fi
+}
+
+# If a valid IP address is provided, push to freemyip service
+function puship {
+  local type
+
+  case $1 in
+    *.*) type=ipv4 ;;
+    *:*) type=ipv6 ;;
+    *)   return 1  ;;
+  esac
+
+  if [[ $(curl --silent https://freemyip.com/update?token=$TOKEN&domain=$DOMAIN.freemyip.com&myip=$1) == OK ]]; then
+    log "pushed new $type address $1"
+    printf -v ${type}renew '%(%s)T'
+    printf -v ${type}renew $(( ${type}renew + (270 * 86400) ))
+  else
+    log "failed to update $type address"
+    return 2
+  fi
+}
+
+### Main program starts here ###################################################
+trap "log 'closing freemyip daemon'; exit" INT TERM
+log "starting freemyip daemon"
+
+# Check for certificates
+if ((cert)); then
+  if [[ -f "$LEGOPATH/certificates/$DOMAIN.freemyip.com.crt" && -f "$LEGOPATH/certificates/$DOMAIN.freemyip.com.key" ]]; then
+    datecert enddate
+  else
+    gencert run
+  fi
+fi
+
+# Main loop
+while true; do
+
+  # Get timestamp
+  printf -v nowdate '%(%s)T'
+
+  # Renew DNS records
+  if ((dns4)) || ((dns6)); then
+
+    # Renew A record if IP has changed
+    getip new4
+    if [[ $old4 != $new4 ]]; then
+
+      # If IP address not found
+      if ! [[ $new4 =~ \. ]]; then
+        log "ipv4 link ${DEVICE/${DEVICE}/${DEVICE} }is down"
+
+      # IP is valid but DNS record not requested
+      elif ! ((dns4)); then
+        log "ipv4 address $new4 is available"
+
+      # IP is valid; write DNS record, but if it fails, forget about the new IP
+      elif ! puship $new4; then
+        new4=$old4
+      fi
+      old4=$new4
+
+    # IP is unchanged; due to time elapsed let's renew the DNS record
+    elif ((dns4)) && [[ $nowdate -gt $ipv4renew ]]; then
+      puship $new4
+    fi
+
+    # Renew AAAA record if IP has changed
+    getip6 new6
+    if [[ $old6 != $new6 ]]; then
+
+      # If IP address not found
+      if ! [[ $new6 =~ \: ]]; then
+        log "ipv6 link ${DEVICE/${DEVICE}/${DEVICE} }is down"
+
+      # IP is valid but DNS record not requested
+      elif ! ((dns6)); then
+        log "ipv6 address $new6 is available"
+
+      # IP is valid; write DNS record, but if it fails, forget about the new IP
+      elif ! puship $new6; then
+        new6=$old6
+      fi
+      old6=$new6
+
+    # IP is unchanged; due to time elapsed let's renew the DNS record
+    elif ((dns6)) && [[ $nowdate -gt $ipv6renew ]]; then
+      puship $new6
+    fi
+  fi
+
+  # Renew certificate if it expires sooner than $RENEWBY days
+  if ((cert)); then
+    if [[ $(($enddate - $nowdate)) -lt $(($RENEWBY * 86400)) ]] && [[ $((nowdate - 3600)) -gt $lastcheck ]]; then
+      gencert renew
+    fi
+  fi
+
+  # Sleep until next cycle
+  sleep $INTERVAL
+done
