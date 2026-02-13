@@ -320,6 +320,7 @@ function datecert {
 # Create or renew certificate. First argument (run|renew) is passed to lego
 function gencert {
   printf -v lastcheck '%(%s)T'
+
   FREEMYIP_TOKEN=$TOKEN                   \
   lego --accept-tos                       \
        --dns freemyip                     \
@@ -327,8 +328,19 @@ function gencert {
        --domains "*.$DOMAIN.freemyip.com" \
        --email "$EMAIL"                   \
        --path "$LEGOPATH"                 \
-       $1                                 \
-    && datecert enddate
+       "$1"
+  lego_status=$?
+
+  # If lego failed, log and exit early
+  if [[ $lego_status -ne 0 ]]; then
+    log "lego failed to ${1/run/generate} certificate (exit code $lego_status)"
+    return $lego_status
+  fi
+
+  if ! datecert enddate; then
+    log "failed to read certificate end date"
+    return 1
+  fi
 
   # Renewal date has been extended if successful
   if [[ $(($enddate - $nowdate)) -gt $(($RENEWBY * 86400)) ]]; then
@@ -337,7 +349,7 @@ function gencert {
     if [[ -n $CERTUSER ]]; then
       chmod g+x "$LEGOPATH/certificates"
       chmod -R g+r "$LEGOPATH/certificates"
-      chgrp -R $CERTUSER "$LEGOPATH/certificates"
+      chgrp -R "$CERTUSER" "$LEGOPATH/certificates"
     fi
     log "certificate written to '$LEGOPATH/certificates'"
 
@@ -350,9 +362,9 @@ ${commands[@]}
 EOF
     fi
 
-  # Log failure if certificate was not created
   else
-    log "failed to " ${1/run/generate} " certificate"
+    log "failed to ${1/run/generate} certificate"
+    return 1
   fi
 }
 
